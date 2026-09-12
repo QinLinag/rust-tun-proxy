@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tun2 = "4"
+tun2 = {version = "4", features = ["async"]}
 
 tokio = {version = "1", features = ["full"]}
 tokio-cron-scheduler = "0.4" # 请确认使用最新版本

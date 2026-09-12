@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::{RwLock, Arc};
 use log::{info, warn, error};
 use std::time::Instant;
-
 pub struct FakeIp {
     ip: Ipv4Addr,
     lastTimeUsed: Instant, //剩余时间，单位秒,  每次使用就会更新
