@@ -1,20 +1,22 @@
 mod fakeip;
 mod tcp;
 mod logger;
+mod proxy;
+mod config;
 use std::println;
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncWriteExt, WriteHalf, AsyncReadExt};
+use tokio::sync::{mpsc};
 use tun2::{AsyncDevice, Configuration};
 use tun2::AbstractDevice;   
 use etherparse::{Ipv4HeaderSlice, Icmpv4Header, Icmpv4Type, PacketBuilder,IpNumber, UdpHeaderSlice, TcpHeaderSlice};
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Record, RData, RecordType, rdata::A};
-use log::{info, warn, error};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
-//定义我们的fakeip常量
-const FAKE_IP_START: Ipv4Addr = Ipv4Addr::new(172, 0, 0, 10); //假设fakeip池从172.0.0.10开始
-const FAKE_IP_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0); //假设fakeip池的子网掩码
+use std::collections::HashMap;
 
+use crate::tcp::Quad;
 
 //写tun的任务
 async fn write_tun(mut writer: WriteHalf<AsyncDevice>, mut write_rx: tokio::sync::mpsc::Receiver<Vec<u8>>) {
@@ -40,38 +42,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     logger::init_logger("/tmp/rustVpn.log");
     info!("vpn started!");
 
+    //配置加载
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
+    let app_config = Arc::new(config::AppConfig::load(&config_path)?);
+
     //fakeip池
-    let fake_ip_pool = Arc::new(fakeip::FakeIpPool::new(FAKE_IP_START,FAKE_IP_MASK));
+    let fake_ip_pool = Arc::new(fakeip::FakeIpPool::new(app_config.fake_ip.start.parse::<Ipv4Addr>()?, app_config.fake_ip.netmask.parse::<Ipv4Addr>()?, app_config.fake_ip.expire_seconds));
     //启动清理fakeip的定时任务，
     let cleaner = Arc::clone(&fake_ip_pool);
     std::thread::spawn(move || {
         loop {
-            info!("Cleaning expired fake IPs");
+            debug!("Cleaning expired fake IPs");
             std::thread::sleep(std::time::Duration::from_secs(5));
             cleaner.clean_fake_ip();
         }
     });
 
-    //创建TCP连接池
-    let mut tcp_stack = tcp::TcpStack::new();
 
     //配置tun
-    let mut config = Configuration::default();
-
-
-    config
-        .address((172,0,0,1)) //tun 设备的ip
-        .netmask((255,255,255,0)) // tun设备的子网掩码
-        .destination((172,0,0,2)) // 对端ip
+    let mut tun_config = Configuration::default();
+    tun_config
+        .address((app_config.tun.address.parse::<Ipv4Addr>()?)) //tun 设备的ip
+        .netmask((app_config.tun.netmask.parse::<Ipv4Addr>()?)) // tun设备的子网掩码
+        .destination((app_config.tun.destination.parse::<Ipv4Addr>()?)) // 对端ip
         .up();
 
     #[cfg(target_os = "linux")]   //linux可能需要root权限
-    config.platform_config(|platform_config| {
+    tun_config.platform_config(|platform_config| {
         platform_config.ensure_root_privileges(true);
     });
 
     // 创建tun设备
-    let dev = tun2::create_as_async(&config)?;
+    let dev = tun2::create_as_async(&tun_config)?;
     println!("Tun device created successfully.");
 
     //获取设备名称
@@ -86,15 +88,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     });
 
     let mut buf = vec![0u8; 65536]; //最大ip包大小
+    let mut routes: HashMap::<Quad, mpsc::Sender::<Vec::<u8>>> = HashMap::new(); //用于存储tcp连接的路由信息
+   
+    let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
-        let amount = reader.read(&mut buf).await?;
+        let amount = tokio::select! {
+            r = reader.read(&mut buf) => r?,
+            _ = cleanup_ticker.tick() => {
+                let mut removed_conn: Vec::<Quad> = Vec::new();
+                for (quad, tx) in &routes {
+                    if tx.is_closed() {
+                        removed_conn.push(*quad);
+                    }
+                }
+                for removed_quad in removed_conn {
+                    routes.remove(&removed_quad);
+                    info!("clean connections, conn is {:?}", removed_quad);
+                }
+                continue;      
+            }
+        };
         println!("Read {} bytes from tun device.", amount);
 
         if amount > 0 {    
+            let packet = &&buf[..amount];
+            let version = packet[0] >> 4;
+            if version != 4 {  //展示只支持ipv4的包
+                debug!("Received non-IPv4 packet");
+                continue;
+            }
+
             //处理数据
-            let ip = Ipv4HeaderSlice::from_slice(&buf[..amount])?; //获取ip头
+            let ip: Ipv4HeaderSlice<'_> = Ipv4HeaderSlice::from_slice(&buf[..amount])?; //获取ip头
             let source =ip.source();
             let destination = ip.destination();
+            let source_ip = Ipv4Addr::from(source);
+            let destination_ip = Ipv4Addr::from(destination);
             let protocol = ip.protocol();
             let ttl = ip.ttl();
             println!("Source: {:?}, Destination: {:?}, Protocol: {:?}, TTL: {:?}", source, destination, protocol, ttl);
@@ -173,9 +202,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
             }
 
             if protocol == IpNumber::TCP {  // 如果是tcp报文的话
-                if let Some(out) = tcp_stack.on_packet(&ip, &buf[payload_start..amount]) {
-                    write_tx.send(out).await?;
+                //刷新一下fakeip和域名时间 todo
+
+                //解析 四元组quad
+                let tcp_header_bytes = &buf[payload_start..amount];
+                let tcp_header_slice = TcpHeaderSlice::from_slice(tcp_header_bytes)?;
+                let source_port = tcp_header_slice.source_port();
+                let destination_port = tcp_header_slice.destination_port();
+                let quad: Quad = (source_ip, source_port, destination_ip, destination_port);
+
+                match routes.get(&quad) {
+                    Some(tx) => { //连接已经有了
+                        if tx.send(tcp_header_bytes.to_vec()).await.is_err() {
+                            routes.remove(&quad); // 对端已经死了。
+                        }
+                    }
+                    None if tcp_header_slice.syn() => { //握手
+                        let (tcp_tx, tcp_rx) = mpsc::channel::<Vec::<u8>>(1024);
+                        let (conn, tcp_task) = tcp::Conn::accept(quad, &tcp_header_slice);
+
+                        routes.insert(quad, tcp_tx.clone());
+                        let write_tx_clone = write_tx.clone();
+                        let fake_ip_pool_clone: Arc<fakeip::FakeIpPool> = Arc::clone(&fake_ip_pool);
+                        let config_for_conn: Arc<config::AppConfig> = Arc::clone(&app_config);
+                        tokio::spawn(async move {
+                            tcp::conn_task(quad, conn, tcp_rx, write_tx_clone, fake_ip_pool_clone, config_for_conn).await;
+                        });
+                        write_tx.send(tcp_task).await.unwrap();
+                        println!("A new tcp connection, quad {:?}", quad);
+                    }
+
+                    None => {} //不认识的tcp连接，直接丢弃
                 }
+                
+                
             }
             let version = (buf[0] >> 4) & 0x0F;
             println!("IP version: {}", version);

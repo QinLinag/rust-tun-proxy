@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::collections::HashMap;
 use std::sync::{RwLock, Arc};
-use log::{info, warn, error};
+use log::{debug, error, info, warn};
 use std::time::Instant;
 pub struct FakeIp {
     ip: Ipv4Addr,
@@ -14,8 +14,8 @@ pub struct FakeIpPool {
 
 
 impl FakeIpPool {
-    pub fn new(start: Ipv4Addr, fakeIpMask: Ipv4Addr) -> Self {
-        let inner = FakeIpPoolInner::new(start, fakeIpMask);
+    pub fn new(start: Ipv4Addr, fakeIpMask: Ipv4Addr, expire_time: u64) -> Self {
+        let inner = FakeIpPoolInner::new(start, fakeIpMask, expire_time);
         Self {
             inner: RwLock::new(inner),
         }
@@ -23,7 +23,7 @@ impl FakeIpPool {
 
     pub fn clean_fake_ip(&self) {
         if let Ok(mut inner) = self.inner.write() {
-            info!("Start to clean expired fake IPs");
+            debug!("Start to clean expired fake IPs");
             inner.cleanFakeIp();
         }
     }
@@ -37,9 +37,18 @@ impl FakeIpPool {
 
     pub fn get_domain_from_ip(&self, ip: Ipv4Addr) -> Option<String> {
         if let Ok(inner) = self.inner.read() {
-            return inner.fakeIpToDomain(ip);
+            let ip = inner.fakeIpToDomain(ip)?;
+            let trim_ip = ip.trim_end_matches(".").to_string();
+            return Some(trim_ip);
         }
         None
+    }
+
+    pub fn is_fake_ip(&self, ip: Ipv4Addr) -> bool {
+        if let Ok(inner) = self.inner.read() {
+            return inner.is_fake_ip(ip);
+        }
+        return false;
     }
 }
 
@@ -63,7 +72,7 @@ pub struct FakeIpPoolInner {
 
 
 impl FakeIpPoolInner {
-    pub fn new(start: Ipv4Addr, fakeIpMask: Ipv4Addr) -> Self {
+    pub fn new(start: Ipv4Addr, fakeIpMask: Ipv4Addr, expire_time: u64) -> Self {
         info!("Initializing FakeIpPoolInner with start IP: {:?} and mask: {:?}", start, fakeIpMask);
         //计算可用的fakeip数、第一个可用fakeip、下一个可用fakeip
         let startIpInt = start.to_bits();
@@ -89,7 +98,7 @@ impl FakeIpPoolInner {
             startIp: start,
             lastIp,
             fakeIpMask: fakeIpMask,
-            expireTime: 5 * 60, //5 min
+            expireTime: expire_time,
             availableIps: available,
             ip_to_domain: HashMap::new(),
             domain_to_ip: HashMap::new(),
@@ -146,6 +155,13 @@ impl FakeIpPoolInner {
 
     pub fn fakeIpToDomain(&self, ip: Ipv4Addr) -> Option<String> {
         self.ip_to_domain.get(&ip).cloned()
+    }
+
+    pub fn is_fake_ip(&self, ip: Ipv4Addr) -> bool {
+        if ip.to_bits() >= self.startIp.to_bits() && ip.to_bits() <= self.lastIp.to_bits() {
+            return true;
+        }
+        return false;
     }
 
 }
